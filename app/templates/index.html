@@ -1,0 +1,194 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="card" id="job">
+  <h2>Статус</h2>
+  <div class="stats">
+    <div class="stat"><span class="muted">Лайков из Яндекса</span><b id="c-total">{{ counts.total }}</b></div>
+    <div class="stat"><span class="muted">Найдено</span><b id="c-matched">{{ counts.matched }}</b></div>
+    <div class="stat"><span class="muted">На проверку</span><b id="c-review">{{ counts.review }}</b></div>
+    <div class="stat"><span class="muted">Не найдено</span><b id="c-nf">{{ counts.not_found }}</b></div>
+    <div class="stat"><span class="muted">Ещё не искали</span><b id="c-new">{{ counts.new }}</b></div>
+    <div class="stat"><span class="muted">В «Любимых»</span><b id="c-lib">{{ counts.saved_library }}</b></div>
+    <div class="stat"><span class="muted">В плейлисте</span><b id="c-pl">{{ counts.in_playlist }}</b></div>
+  </div>
+  <div class="bar"><div id="bar"></div></div>
+  <div id="job-msg">{{ job.message or "Задач нет" }}</div>
+  <div id="job-err" class="flash error" style="{% if not job.error %}display:none{% endif %};margin-top:8px">{{ job.error or "" }}</div>
+  <p class="muted">Запросов к Spotify сегодня: <span id="req">{{ requests_today }}</span> из {{ budget }}
+    <span id="paused">{% if paused_until %} · пауза до {{ paused_until }}{% endif %}</span></p>
+  <form method="post" action="/jobs/stop" id="stop-form" style="{% if not job.running %}display:none{% endif %}">
+    <button class="danger">Остановить</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2><span class="step {% if spotify_ok %}done{% endif %}">1</span> Spotify</h2>
+  {% if spotify_ok %}
+    <p>Подключён аккаунт: <b>{{ spotify_user or "—" }}</b></p>
+    <form method="post" action="/logout"><button class="secondary">Выйти</button></form>
+  {% else %}
+    <p class="muted">Создайте приложение на <a href="https://developer.spotify.com/dashboard" target="_blank">developer.spotify.com/dashboard</a>,
+      укажите в нём Redirect URI <code>{{ redirect_uri }}</code>, отметьте Web API и вставьте сюда Client ID.</p>
+  {% endif %}
+  <form method="post" action="/settings/spotify">
+    <div class="row">
+      <div><label>Client ID</label><input type="text" name="client_id" value="{{ s.spotify_client_id or '' }}" placeholder="32 символа из Dashboard"></div>
+      <div><label>Прокси для Spotify (необязательно)</label><input type="text" name="proxy" value="{{ s.spotify_proxy or '' }}" placeholder="http://127.0.0.1:1080 или socks5://…"></div>
+    </div>
+    <p class="row" style="flex:0"><button class="secondary">Сохранить</button>
+    {% if s.spotify_client_id %}<a class="btn" href="/login">Войти в Spotify</a>{% endif %}</p>
+  </form>
+</div>
+
+<div class="card">
+  <h2><span class="step {% if yandex_user %}done{% endif %}">2</span> Яндекс Музыка</h2>
+  <p class="muted">Нужно для переноса <b>своих</b> лайков. Если переносите открытый плейлист по ссылке, этот шаг можно пропустить.</p>
+  {% if yandex_user %}<p>Подключён аккаунт: <b>{{ yandex_user }}</b></p>{% endif %}
+  <p class="muted">Нажмите «Получить токен», войдите в Яндекс. Браузер перейдёт на music.yandex.ru, а в адресной строке
+    будет <code>#access_token=…</code>. Быстро скопируйте <b>весь адрес</b> и вставьте ниже (подробнее в README).</p>
+  <form method="post" action="/settings/yandex">
+    <div class="row">
+      <div><label>Токен или скопированный адрес</label><input type="password" name="token" value="{{ s.yandex_token or '' }}" placeholder="y0_… или https://music.yandex.ru/#access_token=…"></div>
+      <div><label>Прокси для Яндекса (необязательно)</label><input type="text" name="proxy" value="{{ s.yandex_proxy or '' }}"></div>
+    </div>
+    <p><a class="btn secondary" href="{{ yandex_oauth }}" target="_blank">Получить токен</a>
+       <button>Сохранить и проверить</button></p>
+  </form>
+</div>
+
+<div class="card">
+  <h2><span class="step {% if sources %}done{% endif %}">3</span> Загрузить треки из Яндекса</h2>
+  <p><b>Вариант А. Мои лайки</b> <span class="muted">(нужен токен из шага 2)</span></p>
+  <form method="post" action="/jobs/import"><button {% if not yandex_user or job.running %}disabled{% endif %}>Загрузить «Мне нравится»</button></form>
+  <p style="margin-top:16px"><b>Вариант Б. Мои плейлисты</b> <span class="muted">(нужен токен из шага 2)</span></p>
+  <p><a class="btn secondary" href="/playlists">Выбрать плейлисты…</a></p>
+  <p style="margin-top:16px"><b>Вариант В. По ссылке на открытый плейлист</b> <span class="muted">(например, лайки друга; его токен не нужен)</span></p>
+  <form method="post" action="/jobs/import-link">
+    <div class="row">
+      <div><input type="text" name="url" placeholder="https://music.yandex.ru/users/ЛОГИН/playlists/3"></div>
+      <button style="flex:0 0 auto" {% if job.running %}disabled{% endif %}>Загрузить по ссылке</button>
+    </div>
+  </form>
+  <p class="muted">Подходят ссылки <code>…/users/ЛОГИН/playlists/НОМЕР</code> (лайки обычно <code>playlists/3</code>),
+    <code>…/users/ЛОГИН/tracks</code> и <code>…/playlists/…</code>. Сначала пробуем без токена; если Яндекс не отдаст плейлист,
+    используем ваш токен из шага 2. Плейлист должен быть открытым.</p>
+  <p class="muted">Повторная загрузка того же источника безопасна: найденное не сбрасывается, новые треки добавятся.</p>
+</div>
+
+{% if likes_meta and likes_meta.last_transfer %}
+<div class="card">
+  <h2>Синхронизация новых лайков</h2>
+  <p class="muted">Одной кнопкой: загрузить из Яндекса только то, что вы лайкнули с прошлого раза, найти в Spotify и перенести
+    туда же, куда и в прошлый раз ({% if likes_meta.last_transfer.to_library %}«Любимые треки»{% endif %}{% if likes_meta.last_transfer.to_library and likes_meta.last_transfer.to_playlist %} и {% endif %}{% if likes_meta.last_transfer.to_playlist %}плейлист{% endif %}).
+    Новые лайки окажутся в Spotify сверху, как и в Яндексе.</p>
+  {% if likes_meta.last_sync %}<p>Последняя синхронизация: {{ likes_meta.last_sync.at }}, новых лайков: {{ likes_meta.last_sync.new }}</p>{% endif %}
+  <form method="post" action="/jobs/sync"><button {% if not yandex_user or not spotify_ok or job.running %}disabled{% endif %}>Синхронизировать новые лайки</button></form>
+</div>
+{% endif %}
+
+{% if sources %}
+<div class="card">
+  <h2>Загруженные списки</h2>
+  <p class="muted">Шаги 5–6 и отчёты относятся к выбранному списку. Поиск (шаг 4) идёт сразу по всем.</p>
+  <table>
+    {% for src in sources %}
+    <tr {% if src.key == active %}style="background:var(--ok-bg)"{% endif %}>
+      <td><b>{{ src.title }}</b>{% if src.key == active %} <span class="muted">· выбран</span>{% endif %}<br>
+        <span class="muted">треков {{ src.counts.total }} · найдено {{ src.counts.matched }} · на проверку {{ src.counts.review }}
+          · не найдено {{ src.counts.not_found }} · не искали {{ src.counts.new }}
+          · в «Любимых» {{ src.counts.saved_library }} · в плейлисте {{ src.counts.in_playlist }}</span></td>
+      <td style="width:1%;white-space:nowrap">
+        {% if src.key != active %}
+        <form method="post" action="/sources/select" style="display:inline"><input type="hidden" name="key" value="{{ src.key }}">
+          <button class="secondary">Выбрать</button></form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% if sources|length > 1 %}
+  <form method="post" action="/jobs/transfer-all" style="margin-top:10px">
+    <button class="secondary" {% if not spotify_ok or job.running %}disabled{% endif %}>Перенести все плейлисты (каждый в свой плейлист Spotify)</button>
+    <span class="muted">«Мне нравится» сюда не входит, её переносите в шаге 6.</span>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="card">
+  <h2><span class="step {% if counts.total and not counts.new %}done{% endif %}">4</span> Найти треки в Spotify</h2>
+  <p class="muted">Spotify ограничивает число запросов в день. Если квота закончится, работа встанет на паузу:
+    нажмите кнопку снова после указанного времени, поиск продолжится с того же места. Результаты поиска кэшируются.</p>
+  <form method="post" action="/jobs/match">
+    <label style="display:inline"><input type="checkbox" name="retry_not_found" value="1"> заново искать «не найденные»</label>
+    <p><button {% if not spotify_ok or not counts.total or job.running %}disabled{% endif %}>Начать поиск</button></p>
+  </form>
+</div>
+
+<div class="card">
+  <h2><span class="step {% if counts.total and not counts.review and not counts.new %}done{% endif %}">5</span> Проверить спорные</h2>
+  <p>На проверку: <b>{{ counts.review }}</b>, не найдено: <b>{{ counts.not_found }}</b>.
+    <a href="/review">Открыть проверку</a></p>
+</div>
+
+<div class="card">
+  <h2><span class="step {% if counts.saved_library or counts.in_playlist %}done{% endif %}">6</span> Перенести в Spotify{% if source %}: «{{ source.title }}»{% endif %}</h2>
+  <form method="post" action="/jobs/transfer">
+    <label style="display:inline"><input type="checkbox" name="to_library" value="1" {% if active == my_likes_key %}checked{% endif %}> в «Любимые треки» (лайки)</label><br>
+    <label style="display:inline"><input type="checkbox" name="to_playlist" value="1" {% if active != my_likes_key %}checked{% endif %}> в плейлист</label>
+    <div class="row"><div><label>Название плейлиста</label>
+      <input type="text" name="playlist_name" value="{{ (source and source.playlist and source.playlist.name) or (source and source.playlist_name) or 'Яндекс Музыка: Мне нравится' }}"></div></div>
+    <p class="muted">Будет перенесено найденных треков: {{ counts.matched }}. Лайки добавляются от старых к новым,
+      чтобы порядок в Spotify совпал с Яндексом. Спорные и не найденные не переносятся, пока вы их не подтвердите.</p>
+    <p class="muted">Переносить можно частями, даже когда поиск стоит на паузе из-за лимита: запись идёт отдельно от поиска,
+      а повторный перенос досылает только новое. Но учтите: Spotify сортирует «Любимые» по дате добавления, поэтому треки,
+      найденные позже, окажутся в «Любимых» выше уже перенесённых. Если важен точный порядок лайков, в «Любимые» переносите
+      один раз в конце, а частями — в плейлист (там порядок сохраняется).</p>
+    <p><button {% if not spotify_ok or not counts.matched or job.running %}disabled{% endif %}>Перенести</button></p>
+  </form>
+</div>
+
+<div class="card">
+  <details>
+    <summary>Дополнительно</summary>
+    <form method="post" action="/settings/limits">
+      <div class="row">
+        <div><label>Дневной лимит запросов к Spotify</label><input type="number" name="daily_budget" value="{{ budget }}"></div>
+        <div><label>Пауза между запросами, сек</label><input type="number" step="0.05" name="request_interval" value="{{ s.request_interval or 0.35 }}"></div>
+      </div>
+      <p><button class="secondary">Сохранить лимиты</button></p>
+    </form>
+    {% if paused_until %}
+    <form method="post" action="/settings/unpause"><button class="secondary">Снять паузу (до {{ paused_until }})</button></form>
+    {% endif %}
+    <form method="post" action="/reset" style="margin-top:14px">
+      <label>Очистить выбранный список{% if source %} «{{ source.title }}»{% endif %} (впишите «да»)</label>
+      <div class="row"><input type="text" name="confirm"><button class="danger" style="flex:0">Очистить</button></div>
+    </form>
+  </details>
+</div>
+
+<script>
+let wasRunning = {{ 'true' if job.running else 'false' }};
+async function poll() {
+  try {
+    const r = await fetch('/api/status'); const d = await r.json();
+    const j = d.job, c = d.counts;
+    document.getElementById('job-msg').textContent = j.message || 'Задач нет';
+    const err = document.getElementById('job-err');
+    err.style.display = j.error ? '' : 'none'; err.textContent = j.error || '';
+    document.getElementById('bar').style.width = j.total ? (100 * j.done / j.total) + '%' : (j.running ? '5%' : '0');
+    for (const [id, k] of [['c-total','total'],['c-matched','matched'],['c-review','review'],['c-nf','not_found'],['c-new','new'],['c-lib','saved_library'],['c-pl','in_playlist']])
+      document.getElementById(id).textContent = c[k];
+    document.getElementById('req').textContent = d.requests_today;
+    document.getElementById('paused').textContent = d.paused_until ? ' · пауза до ' + d.paused_until : '';
+    document.getElementById('stop-form').style.display = j.running ? '' : 'none';
+    if (wasRunning && !j.running) { location.reload(); return; }
+    wasRunning = j.running;
+  } catch (e) {}
+  setTimeout(poll, 1500);
+}
+poll();
+</script>
+{% endblock %}

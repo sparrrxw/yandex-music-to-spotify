@@ -1,0 +1,4 @@
+# bat/ps1 храним с CRLF как есть, чтобы Windows их правильно запускал
+*.bat -text
+*.ps1 -text
+README.txt -text

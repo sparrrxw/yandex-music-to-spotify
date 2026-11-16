@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Мои плейлисты в Яндекс Музыке</h2>
+  {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+  {% if not playlists and not error %}<p class="muted">Плейлистов не найдено.</p>{% endif %}
+  {% if playlists %}
+  <form method="post" action="/jobs/import-playlists">
+    <p class="muted">Отметьте плейлисты, которые нужно перенести. Каждый станет отдельным списком, а в Spotify —
+      отдельным плейлистом. Одинаковые треки из разных плейлистов ищутся в Spotify только один раз.</p>
+    <p><label style="display:inline"><input type="checkbox" onclick="document.querySelectorAll('input[name=kind]').forEach(c=>c.checked=this.checked)"> отметить все</label></p>
+    <table>
+      {% for p in playlists %}
+      <tr><td style="width:1%"><input type="checkbox" name="kind" value="{{ p.kind }}" id="k{{ p.kind }}" {% if not p.loaded %}checked{% endif %}></td>
+          <td><label for="k{{ p.kind }}" style="margin:0;color:inherit;font-size:15px">{{ p.title }}</label>
+            <span class="muted">· {{ p.track_count }} треков{% if p.loaded %} · уже загружен (повторная загрузка добавит новые){% endif %}</span></td></tr>
+      {% endfor %}
+    </table>
+    <p><button {% if job.running %}disabled{% endif %}>Загрузить выбранные</button> <a href="/" class="btn secondary">Назад</a></p>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}

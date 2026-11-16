@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Проверка совпадений</h2>
+  <p class="tabs">
+    <a href="/review?status=review" class="{% if status=='review' %}active{% endif %}">Спорные ({{ counts.review }})</a>
+    <a href="/review?status=not_found" class="{% if status=='not_found' %}active{% endif %}">Не найдено ({{ counts.not_found }})</a>
+    <a href="/review?status=auto" class="{% if status=='auto' %}active{% endif %}">Найдено автоматически ({{ counts.auto }})</a>
+    <a href="/review?status=manual" class="{% if status=='manual' %}active{% endif %}">Выбрано вручную ({{ counts.manual }})</a>
+    <a href="/review?status=skipped" class="{% if status=='skipped' %}active{% endif %}">Пропущено ({{ counts.skipped }})</a>
+  </p>
+  <p class="muted">Выберите правильный вариант или вставьте ссылку на трек из Spotify
+    (в Spotify: «Поделиться» → «Скопировать ссылку на трек»). Ссылки на варианты открываются в Spotify, чтобы послушать.
+    Показаны первые 300 треков.</p>
+  {% if status == 'review' and rows %}
+  <form method="post" action="/review-bulk" style="display:inline"><input type="hidden" name="action" value="accept_best">
+    <button class="secondary">Принять лучший вариант у всех спорных</button></form>
+  {% endif %}
+  <p><a href="/not_found.csv">Скачать ненайденные (CSV)</a> · <a href="/not_found.csv?all=1">по всем спискам</a>
+    <span class="muted">— спорные, не найденные и пропущенные; файл можно загрузить в TuneMyMusic</span></p>
+  {% if status == 'not_found' and rows %}
+  <form method="post" action="/review-bulk" style="display:inline"><input type="hidden" name="action" value="skip_not_found">
+    <button class="secondary">Пропустить все не найденные</button></form>
+  {% endif %}
+</div>
+
+<div class="card">
+{% if not rows %}<p class="muted">Здесь пусто.</p>{% endif %}
+<table>
+{% for t in rows %}
+<tr id="t-{{ t.position }}">
+  <td style="width:38%">
+    <b>{{ t.title }}</b>{% if t.version %} <span class="muted">({{ t.version }})</span>{% endif %}<br>
+    {{ t.artists }}<br>
+    <span class="muted">{{ t.album or "" }}{% if t.duration_ms %} · {{ t.duration_ms // 60000 }}:{{ '%02d' % (t.duration_ms // 1000 % 60) }}{% endif %}</span>
+    {% if t.spotify_label %}<br><span class="muted">→ {{ t.spotify_label }}</span>{% endif %}
+  </td>
+  <td>
+    <form method="post" action="/review/{{ t.yandex_id }}">
+      <input type="hidden" name="status" value="{{ status }}">
+      {% for c in t.candidates %}
+      <div class="cand">
+        <input type="radio" name="uri" value="{{ c.uri }}" id="{{ t.yandex_id }}-{{ loop.index }}" {% if c.uri == t.spotify_uri or (loop.first and not t.spotify_uri) %}checked{% endif %}>
+        <span class="score">{{ c.score }}</span>
+        <label for="{{ t.yandex_id }}-{{ loop.index }}" style="margin:0;color:inherit;font-size:14px">
+          {{ c.artists }} — {{ c.name }}
+          <span class="muted">· {{ c.album }}{% if c.duration_ms %} · {{ c.duration_ms // 60000 }}:{{ '%02d' % (c.duration_ms // 1000 % 60) }}{% endif %}</span>
+        </label>
+        {% if c.url %}<a href="{{ c.url }}" target="_blank" title="Открыть в Spotify">↗</a>{% endif %}
+      </div>
+      {% endfor %}
+      <div class="row" style="margin-top:6px">
+        <input type="text" name="link" placeholder="или ссылка https://open.spotify.com/track/…">
+      </div>
+      <p style="margin:6px 0 0">
+        <button name="action" value="pick">Выбрать</button>
+        <button name="action" value="skip" class="secondary">Пропустить</button>
+        {% if status in ('auto', 'manual', 'skipped') %}<button name="action" value="reset" class="secondary">Искать заново</button>{% endif %}
+        <a class="muted" target="_blank" href="https://open.spotify.com/search/{{ (t.artists ~ ' ' ~ t.title) | urlencode }}">искать в Spotify ↗</a>
+      </p>
+    </form>
+    <form method="post" action="/review/{{ t.yandex_id }}/search" class="row" style="margin-top:6px">
+      <input type="hidden" name="status" value="{{ status }}">
+      <input type="text" name="q" value="{{ t.artists.split(',')[0] }} {{ t.title }}" title="Свой запрос к Spotify: можно убрать лишнее, написать латиницей и т. п.">
+      <button class="secondary" style="flex:0 0 auto">Найти</button>
+    </form>
+  </td>
+</tr>
+{% endfor %}
+</table>
+</div>
+{% endblock %}
