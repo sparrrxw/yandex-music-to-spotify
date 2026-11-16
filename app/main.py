@@ -103,6 +103,19 @@ def save_limits(request: Request, daily_budget: int = Form(1500), request_interv
     return _flash(request, "Лимиты сохранены")
 
 
+@app.post("/settings/notifications")
+def settings_notifications(request: Request, enabled: str = Form(""), action: str = Form("save")):
+    from . import notify
+    s = _settings()
+    s["notifications"] = bool(enabled)
+    db.put("settings", s)
+    if action == "test":
+        notify.send("Перенос музыки", "Так будет выглядеть уведомление об окончании переноса")
+        return _flash(request, "Уведомление отправлено. Если оно не появилось, проверьте, что уведомления Windows "
+                               "для PowerShell не отключены (Параметры → Система → Уведомления).")
+    return _flash(request, "Настройка уведомлений сохранена")
+
+
 @app.post("/settings/unpause")
 def unpause(request: Request):
     db.delete("spotify_paused_until")
@@ -243,6 +256,10 @@ def _track_view(r) -> dict:
     d = dict(r)
     d["artists"] = ", ".join(json.loads(r["artists"] or "[]"))
     d["candidates"] = json.loads(r["candidates"] or "[]")
+    src = jobs._source(r)
+    for c in d["candidates"]:
+        if "why" not in c:   # варианты, найденные до обновления: причины считаем на лету
+            c["why"] = matcher.explain(src, c)
     return d
 
 
@@ -310,7 +327,7 @@ def review_search(request: Request, yandex_id: str, q: str = Form(""), status: s
     merged = {c["uri"]: c for c in json.loads(row["candidates"] or "[]")}
     for cand in found:
         if cand.get("uri"):
-            merged[cand["uri"]] = matcher.candidate_view(cand, matcher.score(src, cand))
+            merged[cand["uri"]] = matcher.candidate_view(cand, matcher.score(src, cand), src)
     ranked = sorted(merged.values(), key=lambda c: c["score"] or 0, reverse=True)[:10]
     db.execute("UPDATE tracks SET candidates=? WHERE source_key=? AND yandex_id=?",
                (json.dumps(ranked, ensure_ascii=False), db.active(), yandex_id))

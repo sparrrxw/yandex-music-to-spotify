@@ -1,6 +1,6 @@
 [project]
 name = "yandex-music-to-spotify"
-version = "1.1.0"
+version = "1.2.0"
 description = "Локальный сервис переноса лайков и плейлистов из Яндекс Музыки в Spotify"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -11,7 +11,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "httpx[socks]>=0.27",
     "yandex-music>=3.2.2",
-    "rapidfuzz>=3.9",
+    "rapidfuzz>=3.9", "pillow>=10",
 ]
 
 [dependency-groups]

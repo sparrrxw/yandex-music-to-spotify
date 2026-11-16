@@ -19,10 +19,34 @@ _TRANSLIT = {
     "я": "ya", "і": "i", "ї": "yi", "є": "ye", "ґ": "g",
 }
 
-# Пометки, которые меняют суть записи: ремикс и оригинал — разные треки.
-SIGNIFICANT_TAGS = ("remix", "live", "acoustic", "instrumental", "cover", "karaoke",
-                    "slowed", "sped up", "speed up", "nightcore", "edit", "rmx",
-                    "ремикс", "акустика", "инструментал", "кавер")
+# Пометки, которые меняют суть записи: ремикс, живое исполнение и оригинал — разные треки.
+# Вид версии → шаблоны (ищутся в названии и версии трека, а для части видов ещё в альбоме и артисте).
+VERSION_KINDS: dict[str, str] = {
+    "remix": r"remix(es|ed)?|rmx|re-?mix|bootleg|rework|re-?edit|vip mix|club mix|dub mix|extended mix|mashup|"
+             r"ремикс|ремикс[ыа]?",
+    # «Live Forever», «Cover Me», «Demons» — обычные названия, поэтому эти пометки ищем только в скобках или после тире
+    "live": r"[\(\[]\s*live|[-–—]\s*live|live at|live from|live in|live version|live session|unplugged|in concert|"
+            r"концерт\w*|живьём|живое исполнение",
+    "acoustic": r"acoustic|акустик\w*|акустическ\w*",
+    "instrumental": r"instrumental|инструментал\w*|минус(?:овка)?",
+    "karaoke": r"karaoke|караоке|in the style of|made famous by|originally performed by|backing track",
+    "cover": r"[\(\[]\s*cover|[-–—]\s*cover|cover version|кавер\w*|[\(\[]\s*tribute",
+    "sped": r"slowed|sped up|speed up|speeded up|nightcore|reverb|daycore|замедленн\w*|ускоренн\w*",
+    "arrangement": r"piano version|orchestral|symphonic|lullaby|8-bit|8 bit|string quartet|a cappella|acapella",
+    "demo": r"[\(\[]\s*demo|[-–—]\s*demo|demo version|демо(?:-?версия)?",
+}
+VERSION_NAMES = {
+    "remix": "ремикс", "live": "живое исполнение", "acoustic": "акустическая версия",
+    "instrumental": "инструментал", "karaoke": "караоке", "cover": "кавер", "sped": "ускоренная/замедленная версия",
+    "arrangement": "переаранжировка", "demo": "демо",
+}
+# По альбому и имени артиста узнаём только то, что там правда пишут («Live at Wembley», «Karaoke Hits»,
+# «Vitamin String Quartet», «Rockabye Baby!»), а не «Remix» в названии сборника.
+_ALBUM_KINDS = ("live", "karaoke", "cover", "arrangement")
+_ARTIST_RE = re.compile(r"karaoke|караоке|tribute|string quartet|rockabye baby|lullaby|piano tribute|"
+                        r"8-bit|8 bit|cover band|кавер", re.I)
+_KIND_RE = {k: re.compile(rf"(?<![\w])(?:{v})(?![\w])", re.I) for k, v in VERSION_KINDS.items()}
+
 # Пометки, которые на суть не влияют и только мешают сравнению.
 NOISE_RE = re.compile(
     r"\b(remaster(ed)?(\s+\d{4})?|\d{4}\s+remaster(ed)?|original mix|radio edit|album version|"
@@ -55,8 +79,17 @@ def normalize(s: str) -> str:
 
 
 def tags_of(s: str) -> set[str]:
-    low = (s or "").lower()
-    return {t for t in SIGNIFICANT_TAGS if re.search(rf"\b{re.escape(t)}\b", low)}
+    """Виды версии по тексту названия: {"remix", "live", ...}."""
+    low = NOISE_RE.sub(" ", unicodedata.normalize("NFKC", s or "").lower())
+    return {k for k, rx in _KIND_RE.items() if rx.search(low)}
+
+
+def version_kinds(title: str, album: str | None = None, artists: list[str] | None = None) -> set[str]:
+    kinds = tags_of(title)
+    kinds |= {k for k in tags_of(album or "") if k in _ALBUM_KINDS}
+    if any(_ARTIST_RE.search(a or "") for a in artists or []):
+        kinds.add("cover")
+    return kinds
 
 
 @dataclass
@@ -73,60 +106,95 @@ class Source:
         return f"{self.title} ({self.version})" if self.version else self.title
 
 
-def score(src: Source, cand: dict) -> float:
-    """Оценка 0–100 для кандидата из ответа Spotify /search (объект track)."""
-    c_title = cand.get("name") or ""
-    c_artists = [a.get("name", "") for a in cand.get("artists", [])]
-    c_album = (cand.get("album") or {}).get("name") or ""
-    c_dur = cand.get("duration_ms")
+def _cand_fields(cand: dict) -> tuple[str, list[str], str]:
+    """Название, артисты, альбом кандидата: и из ответа Spotify, и из сохранённого вида для страницы проверки."""
+    arts = cand.get("artists") or []
+    if isinstance(arts, str):
+        arts = [a.strip() for a in arts.split(",")]
+    arts = [a.get("name", "") if isinstance(a, dict) else a for a in arts]
+    album = cand.get("album") or ""
+    if isinstance(album, dict):
+        album = album.get("name") or ""
+    return cand.get("name") or "", [a for a in arts if a], album
 
-    # Название (40)
-    t1, t2 = normalize(src.full_title), normalize(c_title)
-    t1b = normalize(src.title)
+
+def _parts(src: Source, cand: dict) -> dict:
+    """Составляющие оценки: похожесть названия, артиста, альбома, разница длительности, виды версий."""
+    c_title, c_artists, c_album = _cand_fields(cand)
+
     def _sim(a: str, b: str) -> float:
         # token_set прощает лишние слова, ratio штрафует за них ("love" vs "love me do")
         return 0.6 * fuzz.token_set_ratio(a, b) + 0.4 * fuzz.ratio(a, b)
 
-    title_sim = max(_sim(t1, t2), _sim(t1b, t2))
-    s = 40 * title_sim / 100
-
-    # Артисты (30): лучшее совпадение для главного артиста + доля совпавших остальных
+    t2 = normalize(c_title)
+    title_sim = max(_sim(normalize(src.full_title), t2), _sim(normalize(src.title), t2))
     src_art = [normalize(a) for a in src.artists if a] or [""]
-    cand_art = [normalize(a) for a in c_artists if a] or [""]
+    cand_art = [normalize(a) for a in c_artists] or [""]
     main = max(fuzz.token_sort_ratio(src_art[0], ca) for ca in cand_art)
     joined = fuzz.token_set_ratio(" ".join(src_art), " ".join(cand_art))
-    s += 30 * max(main, joined) / 100
+    c_dur = cand.get("duration_ms")
+    return {
+        "title": title_sim,
+        "artist": max(main, joined) if any(src_art) else 100.0,
+        "album": fuzz.token_set_ratio(normalize(src.album), normalize(c_album)) if src.album and c_album else None,
+        "dur_diff": abs(src.duration_ms - c_dur) / 1000 if src.duration_ms and c_dur else None,
+        "src_kinds": version_kinds(src.full_title, src.album, src.artists),
+        "cand_kinds": version_kinds(c_title, c_album, c_artists),
+        "isrc": bool(src.isrc and cand.get("isrc") and src.isrc.upper() == cand["isrc"].upper()),
+    }
 
-    # Длительность (20)
-    if src.duration_ms and c_dur:
-        diff = abs(src.duration_ms - c_dur) / 1000
-        if diff <= 3:
-            s += 20
-        elif diff <= 10:
-            s += 20 * (10 - diff) / 7
-        elif diff > 30:
-            s -= 10
-    else:
+
+def score(src: Source, cand: dict) -> float:
+    """Оценка 0–100 для кандидата из ответа Spotify /search (объект track)."""
+    p = _parts(src, cand)
+    s = 40 * p["title"] / 100 + 30 * p["artist"] / 100           # название (40) и артисты (30)
+    d = p["dur_diff"]                                                # длительность (20)
+    if d is None:
         s += 10
+    elif d <= 3:
+        s += 20
+    elif d <= 10:
+        s += 20 * (10 - d) / 7
+    elif d > 30:
+        s -= 10
+    s += 5 if p["album"] is None else 10 * p["album"] / 100       # альбом (10)
 
-    # Альбом (10)
-    if src.album and c_album:
-        s += 10 * fuzz.token_set_ratio(normalize(src.album), normalize(c_album)) / 100
-    else:
-        s += 5
-
-    # Ремикс/лайв/акустика должны совпадать
-    src_tags = tags_of(src.full_title)
-    cand_tags = tags_of(c_title)
-    if src_tags != cand_tags:
-        s -= 15 * len(src_tags ^ cand_tags)
-
-    # Совпал ISRC — это та же запись, даже если Spotify подписал её иначе
-    # (латиницей, с другим альбомом). Но не даём ISRC перебить явное расхождение версий.
-    if src.isrc and cand.get("isrc") and src.isrc.upper() == cand["isrc"].upper() and src_tags == cand_tags:
+    same_kind = p["src_kinds"] == p["cand_kinds"]
+    if not same_kind:
+        # Ремикс вместо оригинала (и наоборот) — штраф, и такой трек никогда не принимается сам:
+        # максимум «спорный», решает человек.
+        s -= 15 * len(p["src_kinds"] ^ p["cand_kinds"])
+        s = min(s, AUTO_THRESHOLD - 1)
+    elif p["isrc"]:
+        # Совпал ISRC — это та же запись, даже если сервис подписал её иначе (латиницей, с другим альбомом).
         s = max(s, 97.0)
-
     return round(max(0.0, min(100.0, s)), 1)
+
+
+def explain(src: Source, cand: dict) -> list[str]:
+    """Почему кандидат не идеален: короткие причины по-русски (пусто, если всё совпало)."""
+    p = _parts(src, cand)
+    why = []
+    for k in sorted(p["cand_kinds"] - p["src_kinds"]):
+        why.append(f"найден {VERSION_NAMES[k]}, а в источнике обычная версия")
+    for k in sorted(p["src_kinds"] - p["cand_kinds"]):
+        why.append(f"в источнике {VERSION_NAMES[k]}, а найдено другое")
+    if p["isrc"] and p["src_kinds"] == p["cand_kinds"]:
+        return why
+    if p["artist"] < 80:
+        why.append("другой артист" if p["artist"] < 50 else "артист записан иначе")
+    if p["title"] < 85:
+        why.append("другое название" if p["title"] < 60 else "название немного отличается")
+    if p["dur_diff"] is not None and p["dur_diff"] > 10:
+        why.append(f"длительность отличается на {fmt_secs(p['dur_diff'])}")
+    if p["album"] is not None and p["album"] < 50:
+        why.append("другой альбом")
+    return why
+
+
+def fmt_secs(sec: float) -> str:
+    sec = int(round(sec))
+    return f"{sec} с" if sec < 60 else f"{sec // 60}:{sec % 60:02d}"
 
 
 def build_queries(src: Source) -> list[str]:
@@ -152,8 +220,9 @@ def build_queries(src: Source) -> list[str]:
     return out
 
 
-def candidate_view(cand: dict, sc: float) -> dict:
+def candidate_view(cand: dict, sc: float, src: Source | None = None) -> dict:
     return {
+        "why": explain(src, cand) if src is not None else [],
         "uri": cand.get("uri"),
         "name": cand.get("name"),
         "artists": ", ".join(a.get("name", "") for a in cand.get("artists", [])),
@@ -170,3 +239,9 @@ def classify(best: float) -> str:
     if best >= REVIEW_THRESHOLD:
         return "review"
     return "not_found"
+
+
+def kinds_differ(src: Source, cand: dict) -> bool:
+    """Версии не совпадают (ремикс вместо оригинала и т. п.): такой трек сам не принимается."""
+    p = _parts(src, cand)
+    return p["src_kinds"] != p["cand_kinds"]

@@ -34,6 +34,9 @@
     {{ t.artists }}<br>
     <span class="muted">{{ t.album or "" }}{% if t.duration_ms %} · {{ t.duration_ms // 60000 }}:{{ '%02d' % (t.duration_ms // 1000 % 60) }}{% endif %}</span>
     {% if t.spotify_label %}<br><span class="muted">→ {{ t.spotify_label }}</span>{% endif %}
+    {% if t.candidates and t.candidates[0].why and status in ('review', 'not_found') %}
+    <br><span class="why">Почему спорный: {{ t.candidates[0].why | join("; ") }}</span>
+    {% elif not t.candidates and status == 'not_found' %}<br><span class="why">Ничего похожего не нашлось</span>{% endif %}
   </td>
   <td>
     <form method="post" action="/review/{{ t.yandex_id }}">
@@ -47,6 +50,7 @@
           <span class="muted">· {{ c.album }}{% if c.duration_ms %} · {{ c.duration_ms // 60000 }}:{{ '%02d' % (c.duration_ms // 1000 % 60) }}{% endif %}</span>
         </label>
         {% if c.url %}<a href="{{ c.url }}" target="_blank" title="Открыть в Spotify">↗</a>{% endif %}
+        {% if c.why %}<br><span class="why">{{ c.why | join("; ") }}</span>{% endif %}
       </div>
       {% endfor %}
       <div class="row" style="margin-top:6px">

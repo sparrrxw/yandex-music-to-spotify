@@ -13,7 +13,8 @@
     <div class="stat"><span class="muted">В плейлисте</span><b id="c-pl">{{ counts.in_playlist }}</b></div>
   </div>
   <div class="bar"><div id="bar"></div></div>
-  <div id="job-msg">{{ job.message or "Задач нет" }}</div>
+  <div><span id="job-msg">{{ job.message or "Задач нет" }}</span>
+    <span class="muted" id="job-eta">{% if job.eta %} · осталось примерно {{ job.eta }}{% endif %}</span></div>
   <div id="job-err" class="flash error" style="{% if not job.error %}display:none{% endif %};margin-top:8px">{{ job.error or "" }}</div>
   <p class="muted">Запросов к Spotify сегодня: <span id="req">{{ requests_today }}</span> из {{ budget }}
     <span id="paused">{% if paused_until %} · пауза до {{ paused_until }}{% endif %}</span></p>
@@ -162,6 +163,12 @@
     {% if paused_until %}
     <form method="post" action="/settings/unpause"><button class="secondary">Снять паузу (до {{ paused_until }})</button></form>
     {% endif %}
+    <form method="post" action="/settings/notifications" style="margin-top:14px">
+      <label style="display:inline;color:inherit;font-size:15px"><input type="checkbox" name="enabled" value="1" {% if s.notifications is not defined or s.notifications %}checked{% endif %}>
+        Уведомление Windows, когда долгая задача закончилась или упёрлась в лимит Spotify</label>
+      <p><button class="secondary" name="action" value="save">Сохранить</button>
+        <button class="secondary" name="action" value="test">Проверить уведомление</button></p>
+    </form>
     <form method="post" action="/reset" style="margin-top:14px">
       <label>Очистить выбранный список{% if source %} «{{ source.title }}»{% endif %} (впишите «да»)</label>
       <div class="row"><input type="text" name="confirm"><button class="danger" style="flex:0">Очистить</button></div>
@@ -176,6 +183,7 @@ async function poll() {
     const r = await fetch('/api/status'); const d = await r.json();
     const j = d.job, c = d.counts;
     document.getElementById('job-msg').textContent = j.message || 'Задач нет';
+    document.getElementById('job-eta').textContent = j.eta ? ' · осталось примерно ' + j.eta : '';
     const err = document.getElementById('job-err');
     err.style.display = j.error ? '' : 'none'; err.textContent = j.error || '';
     document.getElementById('bar').style.width = j.total ? (100 * j.done / j.total) + '%' : (j.running ? '5%' : '0');

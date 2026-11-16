@@ -7,24 +7,57 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import traceback
 from datetime import datetime
 
-from . import db, matcher, spotify_client as sp, yandex_client
+from . import db, matcher, notify, spotify_client as sp, yandex_client
 
 _state_lock = threading.Lock()
 _state = {"name": None, "running": False, "message": "", "error": None, "done": 0, "total": 0,
           "finished_at": None}
 _stop = threading.Event()
+_phase = {"start": 0.0, "done0": 0, "total": None, "started_at": 0.0}
+
+JOB_TITLES = {"import": "Загрузка", "match": "Поиск", "transfer": "Перенос", "sync": "Синхронизация"}
+
+
+def fmt_duration(sec: float) -> str:
+    sec = int(round(sec))
+    if sec < 60:
+        return "меньше минуты"
+    m = sec // 60
+    if m < 60:
+        return f"{m} мин"
+    h, m = divmod(m, 60)
+    return f"{h} ч {m} мин" if m else f"{h} ч"
+
+
+def eta_seconds(done: int, total: int, elapsed: float, done0: int = 0) -> float | None:
+    """Оценка оставшегося времени по средней скорости текущего этапа. None — пока рано судить."""
+    progressed = done - done0
+    if not total or progressed < 3 or elapsed < 3 or done >= total:
+        return None
+    return (total - done) * elapsed / progressed
 
 
 def state() -> dict:
     with _state_lock:
-        return dict(_state)
+        st = dict(_state)
+        ph = dict(_phase)
+    st["eta"] = None
+    if st["running"] and st["total"]:
+        sec = eta_seconds(st["done"], st["total"], time.time() - ph["start"], ph["done0"])
+        if sec is not None:
+            st["eta"] = fmt_duration(sec)
+    return st
 
 
 def _set(**kw) -> None:
     with _state_lock:
+        # новый этап (поменялось общее число) — скорость считаем заново
+        if "total" in kw and kw["total"] != _phase["total"]:
+            _phase.update(start=time.time(), done0=kw.get("done", 0), total=kw["total"])
         _state.update(kw)
 
 
@@ -36,8 +69,8 @@ def _run(name: str, fn) -> bool:
     with _state_lock:
         if _state["running"]:
             return False
-        _state.update(name=name, running=True, message="Запуск…", error=None, done=0, total=0,
-                      finished_at=None)
+        _state.update(name=name, running=True, message="Запуск…", error=None, done=0, total=0, finished_at=None)
+        _phase.update(start=time.time(), done0=0, total=0, started_at=time.time())
     _stop.clear()
 
     def wrapper():
@@ -51,9 +84,24 @@ def _run(name: str, fn) -> bool:
             _set(error=str(e) or e.__class__.__name__)
         finally:
             _set(running=False, finished_at=datetime.now().strftime("%H:%M:%S"))
+            _notify_finished(name)
 
     threading.Thread(target=wrapper, daemon=True, name=f"job-{name}").start()
     return True
+
+
+def _notify_finished(name: str) -> None:
+    """Уведомление Windows, если задача шла дольше минуты или упёрлась в лимит/ошибку."""
+    st = state()
+    s = db.get("settings", {}) or {}
+    long_job = time.time() - _phase["started_at"] >= float(s.get("notify_after", 60))
+    if not (long_job or st["error"]) or not s.get("notifications", True):
+        return
+    title = JOB_TITLES.get(name, "Задача")
+    if st["error"]:
+        notify.send(f"{title}: остановлено", st["error"])
+    else:
+        notify.send(f"{title}: готово", st["message"] or "Готово")
 
 
 # --- 1. Импорт ---------------------------------------------------------------
@@ -75,7 +123,7 @@ def start_import_link(url: str) -> bool:
         link = yandex_client.parse_link(url)
         key = yandex_client.link_key(link)
         title, total = yandex_client.fetch_link(url, progress=lambda m: _set(message=m))
-        db.save_source(key, {"title": title, "url": url, "kind": "link",
+        db.save_source(key, {"title": title, "url": url, "kind": "link", **yandex_client.last_meta,
                              "playlist_name": db.source(key).get("playlist_name") or f"Яндекс Музыка: {title}"})
         db.set_active(key)
         _set(message=f"Готово: из «{title}» загружено {total} треков", done=total, total=total)
@@ -91,7 +139,7 @@ def start_import_my_playlists(kinds: list[int]) -> bool:
                 break
             key, title, n = yandex_client.fetch_my_playlist(
                 kind, progress=lambda m, i=i: _set(message=f"Плейлист {i} из {len(kinds)}: {m}"))
-            db.save_source(key, {"title": title, "kind": "my_playlist",
+            db.save_source(key, {"title": title, "kind": "my_playlist", **yandex_client.last_meta,
                                  "playlist_name": db.source(key).get("playlist_name") or title})
             done_titles.append(f"{title} ({n})")
             _set(done=i)
@@ -134,7 +182,7 @@ def match_one(row) -> None:
         "WHERE source_key=? AND yandex_id=?",
         (
             status, top_score,
-            json.dumps([matcher.candidate_view(c, s) for s, c in ranked], ensure_ascii=False),
+            json.dumps([matcher.candidate_view(c, s, src) for s, c in ranked], ensure_ascii=False),
             top["uri"] if status == "auto" else None,
             f"{', '.join(a['name'] for a in top['artists'])} — {top['name']}" if status == "auto" else None,
             row["source_key"], row["yandex_id"],
@@ -183,8 +231,24 @@ def _match_rows(rows) -> bool:
     return True
 
 
+def _recheck_versions() -> int:
+    """Старые автоматические совпадения, где вместо оригинала нашёлся ремикс, кавер, live и т. п.,
+    возвращаем на проверку (ещё не перенесённые). Так прежние результаты подчиняются новым правилам."""
+    n = 0
+    for row in db.query("SELECT * FROM tracks WHERE status='auto' AND saved_library=0 AND in_playlist=0"):
+        cands = json.loads(row["candidates"] or "[]")
+        top = next((c for c in cands if c.get("uri") == row["spotify_uri"]), None)
+        if top and matcher.kinds_differ(_source(row), top):
+            db.execute("UPDATE tracks SET status='review', spotify_uri=NULL, spotify_label=NULL, score=MIN(score, ?) "
+                       "WHERE source_key=? AND yandex_id=?",
+                       (matcher.AUTO_THRESHOLD - 1, row["source_key"], row["yandex_id"]))
+            n += 1
+    return n
+
+
 def start_match(rematch_not_found: bool = False) -> bool:
     def work():
+        _recheck_versions()
         statuses = ("new", "not_found") if rematch_not_found else ("new",)
         # ищем по всем загруженным источникам; текущий — первым
         rows = db.query(
@@ -232,34 +296,79 @@ def _transfer_source(key: str, to_library: bool, to_playlist: bool, playlist_nam
     if to_playlist:
         name = (playlist_name or meta.get("playlist_name") or f"Яндекс Музыка: {title}").strip()
         pl = meta.get("playlist") or {}
+        notes = []
         if not pl.get("id") or pl.get("name") != name:
-            pl = {"id": sp.create_playlist(name, "Перенесено из Яндекс Музыки"), "name": name}
+            pl = {"id": _make_playlist(meta, name, notes), "name": name}
             db.save_source(key, {"playlist": pl, "playlist_name": name})
             db.execute("UPDATE tracks SET in_playlist=0 WHERE source_key=?", (key,))
         # В плейлисте порядок как в Яндексе: сверху то, что было сверху.
         rows = db.query(
             "SELECT yandex_id, spotify_uri FROM tracks WHERE source_key=? AND status IN ('auto','manual') "
             "AND spotify_uri IS NOT NULL AND in_playlist=0 ORDER BY position ASC", (key,))
+        # Что уже лежит в плейлисте Spotify (добавлено раньше, вручную или до очистки базы) — не дублируем.
+        added = set()
+        if rows:
+            try:
+                added = sp.playlist_item_uris(pl["id"])
+            except Exception:  # noqa: BLE001  (не смогли прочитать — опираемся на свою базу)
+                added = set()
+        # один и тот же трек Spotify мог найтись для двух версий из Яндекса
+        added |= {r["spotify_uri"] for r in db.query(
+            "SELECT spotify_uri FROM tracks WHERE source_key=? AND in_playlist=1 AND spotify_uri IS NOT NULL", (key,))}
+        skipped = 0
         _set(total=len(rows), done=0, message=f"«{title}» → плейлист «{name}»: 0 из {len(rows)}")
         for i in range(0, len(rows), sp.PLAYLIST_BATCH):
             if _stop.is_set():
                 _set(message="Остановлено")
                 return False
             chunk = rows[i:i + sp.PLAYLIST_BATCH]
-            # один и тот же трек Spotify мог найтись для двух версий из Яндекса
-            added = {r["spotify_uri"] for r in db.query(
-                "SELECT spotify_uri FROM tracks WHERE source_key=? AND in_playlist=1 AND spotify_uri IS NOT NULL",
-                (key,))}
             uris = []
             for r in chunk:
-                if r["spotify_uri"] not in added:
+                if r["spotify_uri"] in added:
+                    skipped += 1
+                else:
                     added.add(r["spotify_uri"])
                     uris.append(r["spotify_uri"])
             if uris:
                 sp.add_to_playlist(pl["id"], uris)
             _mark("in_playlist", key, chunk)
             _set(done=i + len(chunk), message=f"«{title}» → плейлист «{name}»: {i + len(chunk)} из {len(rows)}")
+        if skipped:
+            notes.append(f"пропущено дублей: {skipped}")
+        _notes.extend(notes)
     return True
+
+
+_notes: list[str] = []   # заметки последнего переноса (обложка, дубли) для итогового сообщения
+
+
+def _description(meta: dict) -> str:
+    tail = "Перенесено из Яндекс Музыки"
+    desc = " ".join((meta.get("description") or "").split())   # переносы строк Spotify не принимает
+    if not desc:
+        return tail
+    room = sp.DESCRIPTION_LIMIT - len(tail) - 3
+    if len(desc) > room:
+        desc = desc[:max(0, room - 1)].rstrip() + "…"
+    return f"{desc} · {tail}" if desc else tail
+
+
+def _make_playlist(meta: dict, name: str, notes: list) -> str:
+    """Находит свой плейлист с таким названием или создаёт новый с описанием и обложкой из Яндекса."""
+    pid = sp.find_playlist(name)
+    if pid:
+        notes.append("плейлист с таким названием уже был, дополнил его без дублей")
+        return pid
+    pid = sp.create_playlist(name, _description(meta))
+    if meta.get("image"):
+        from . import covers
+        try:
+            proxy = ((db.get("settings", {}) or {}).get("yandex_proxy") or "").strip() or None
+            sp.set_cover(pid, covers.to_jpeg(covers.download(meta["image"], proxy)))
+            notes.append("обложка перенесена")
+        except Exception as e:  # noqa: BLE001  (без обложки плейлист всё равно полезен)
+            notes.append(f"обложку перенести не удалось: {e}")
+    return pid
 
 
 def start_transfer(to_library: bool, to_playlist: bool, playlist_name: str, key: str | None = None) -> bool:
@@ -267,10 +376,12 @@ def start_transfer(to_library: bool, to_playlist: bool, playlist_name: str, key:
 
     def work():
         db.save_source(key, {"last_transfer": {"to_library": to_library, "to_playlist": to_playlist}})
+        _notes.clear()
         if not _transfer_source(key, to_library, to_playlist, playlist_name):
             return
         c = db.counts(key)
-        _set(message=f"Перенос завершён. В «Любимых»: {c['saved_library']}, в плейлисте: {c['in_playlist']}")
+        _set(message=f"Перенос завершён. В «Любимых»: {c['saved_library']}, в плейлисте: {c['in_playlist']}"
+                     + (f" ({'; '.join(_notes)})" if _notes else ""))
     return _run("transfer", work)
 
 
@@ -305,8 +416,13 @@ def start_transfer_all_playlists() -> bool:
     """Каждый загруженный плейлист (кроме моих лайков) — в свой плейлист Spotify."""
     def work():
         keys = [k for k in db.sources() if k != db.MY_LIKES]
+        _notes.clear()
         for n, key in enumerate(keys, 1):
             if not _transfer_source(key, False, True, None):
                 return
-        _set(message=f"Перенесено плейлистов: {len(keys)}")
+        covers_ok = sum(1 for x in _notes if x == "обложка перенесена")
+        dups = sum(int(x.split(": ")[1]) for x in _notes if x.startswith("пропущено дублей"))
+        extra = [f"обложек: {covers_ok}"] if covers_ok else []
+        extra += [f"пропущено дублей: {dups}"] if dups else []
+        _set(message=f"Перенесено плейлистов: {len(keys)}" + (f" ({', '.join(extra)})" if extra else ""))
     return _run("transfer", work)

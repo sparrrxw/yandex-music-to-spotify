@@ -21,7 +21,8 @@ from . import db
 AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API = "https://api.spotify.com/v1"
-SCOPES = "user-library-read user-library-modify playlist-modify-private playlist-modify-public"
+SCOPES = ("user-library-read user-library-modify playlist-modify-private playlist-modify-public "
+          "playlist-read-private ugc-image-upload")
 
 LIBRARY_BATCH = 40
 PLAYLIST_BATCH = 100
@@ -276,6 +277,60 @@ def create_playlist(name: str, description: str = "") -> str:
     if not data.get("id"):
         raise SpotifyError("Spotify не вернул id созданного плейлиста")
     return data["id"]
+
+
+DESCRIPTION_LIMIT = 300
+
+
+def set_cover(playlist_id: str, jpeg: bytes) -> None:
+    """Обложка плейлиста: JPEG до 256 КБ в base64, нужен scope ugc-image-upload."""
+    _before_request(essential=True)
+    with _http() as h:
+        r = h.put(f"{API}/playlists/{playlist_id}/images", content=base64.b64encode(jpeg),
+                  headers={"Authorization": f"Bearer {_access_token()}", "Content-Type": "image/jpeg"})
+    if r.status_code in (401, 403):
+        raise SpotifyError("Spotify не дал поставить обложку: нажмите «Выйти» и войдите в Spotify заново "
+                           "(нужно новое разрешение на загрузку картинок)")
+    if r.status_code >= 400:
+        raise SpotifyError(f"Spotify не принял обложку: {r.status_code} {r.text[:200]}")
+
+
+def _paged(path: str, params: dict | None = None):
+    params = dict(params or {})
+    params.setdefault("limit", 50)
+    params["offset"] = 0
+    while True:
+        data = request("GET", path, params=params, essential=True) or {}
+        items = data.get("items") or []
+        yield from items
+        if not data.get("next") or not items:
+            return
+        params["offset"] += len(items)
+
+
+def playlist_item_uris(playlist_id: str) -> set[str]:
+    """URI треков, которые уже лежат в плейлисте (чтобы не добавлять дубли)."""
+    out = set()
+    for it in _paged(f"/playlists/{playlist_id}/items"):
+        t = (it or {}).get("track") or (it or {}).get("item") or {}
+        if t.get("uri"):
+            out.add(t["uri"])
+    return out
+
+
+def find_playlist(name: str) -> str | None:
+    """Свой плейлист с таким названием (чтобы не плодить копии, если база была очищена)."""
+    try:
+        my_id = (db.get("spotify_user") or {}).get("id")
+        for pl in _paged("/me/playlists"):
+            if not pl:
+                continue
+            owner = (pl.get("owner") or {}).get("id")
+            if (pl.get("name") or "").strip() == name.strip() and (not my_id or owner == my_id):
+                return pl.get("id")
+    except Exception:  # noqa: BLE001  (не смогли проверить — просто создадим новый)
+        return None
+    return None
 
 
 def add_to_playlist(playlist_id: str, uris: list[str]) -> None:

@@ -17,6 +17,24 @@ YANDEX_OAUTH_URL = (
 )
 
 
+# Описание и обложка последнего загруженного плейлиста (для переноса в Spotify).
+last_meta: dict = {}
+
+
+def _cover_url(pl) -> str | None:
+    uri = getattr(getattr(pl, "cover", None), "uri", None) or getattr(pl, "og_image", None)
+    if not uri:
+        return None
+    uri = uri.replace("%%", "400x400")
+    return uri if uri.startswith("http") else "https://" + uri
+
+
+def _remember(pl) -> None:
+    last_meta.clear()
+    last_meta.update({"description": (getattr(pl, "description", None) or "").strip(),
+                      "image": _cover_url(pl)})
+
+
 def parse_token(text: str) -> str:
     """Принимает сам токен или целиком скопированный адрес с access_token=..."""
     text = (text or "").strip()
@@ -120,6 +138,7 @@ def parse_link(url: str) -> dict:
 
 
 def _load_link(client: Client, link: dict) -> tuple[str, list]:
+    last_meta.clear()
     if link["type"] == "user_likes":
         likes = client.users_likes_tracks(user_id=link["user"])
         shorts = list(likes.tracks) if likes else []
@@ -133,6 +152,7 @@ def _load_link(client: Client, link: dict) -> tuple[str, list]:
         pl = pl[0] if pl else None
     if pl is None:
         raise RuntimeError("Яндекс не вернул плейлист")
+    _remember(pl)
     title = pl.title or "Плейлист"
     if link["type"] == "user_playlist" and link["kind"] == 3:
         title = f"Мне нравится ({link['user']})"
@@ -174,6 +194,7 @@ def fetch_my_playlist(kind: int, progress: Callable[[str], None] | None = None) 
         pl = pl[0] if pl else None
     if pl is None:
         raise RuntimeError(f"Яндекс не вернул плейлист {kind}")
+    _remember(pl)
     key = link_key(link)
     return key, pl.title or f"Плейлист {kind}", _store(client, list(pl.tracks or []), progress, key)
 

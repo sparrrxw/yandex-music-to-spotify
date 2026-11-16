@@ -52,7 +52,7 @@ def test_full_flow(env, monkeypatch):
             q = params["q"].lower()
             items = [v for k, v in catalog.items() if k in q]
             return {"tracks": {"items": items}}
-        if path == "/me/playlists":
+        if method == "POST" and path == "/me/playlists":
             return {"id": "PL1"}
         return None
     monkeypatch.setattr(sp, "request", fake_request)
@@ -71,7 +71,7 @@ def test_full_flow(env, monkeypatch):
     assert len(lib) == 1
     # лайки идут от старого к новому: Queen (позиция 1) раньше Кино (позиция 0)
     assert lib[0][2]["uris"] == "spotify:track:" + "b" * 22 + ",spotify:track:" + "a" * 22
-    pl = [x for x in calls if x[1] == "/playlists/PL1/items"]
+    pl = [x for x in calls if x[:2] == ("POST", "/playlists/PL1/items")]
     assert pl[0][3]["uris"] == ["spotify:track:" + "a" * 22, "spotify:track:" + "b" * 22]
     c = db.counts()
     assert c["saved_library"] == 2 and c["in_playlist"] == 2
@@ -196,7 +196,7 @@ def _fake_search(monkeypatch, catalog):
                 if k in q:
                     items += v
             return {"tracks": {"items": items}}
-        if path == "/me/playlists":
+        if method == "POST" and path == "/me/playlists":
             return {"id": "PL" + str(len(calls))}
         return None
     monkeypatch.setattr(sp, "request", fake_request)
@@ -306,9 +306,9 @@ def test_playlists_transfer_all_and_shared_tracks(env, monkeypatch):
     assert db.counts("*")["auto"] == 3
     assert jobs.start_transfer_all_playlists(); st = wait_job()
     assert st["error"] is None, st
-    created = [c for c in calls if c[1] == "/me/playlists"]
+    created = [c for c in calls if c[:2] == ("POST", "/me/playlists")]
     assert [c[3]["name"] for c in created] == ["Яндекс Музыка: Рок", "Яндекс Музыка: Дорога"]
-    adds = [c for c in calls if c[1].endswith("/items")]
+    adds = [c for c in calls if c[0] == "POST" and c[1].endswith("/items")]
     assert len(adds[0][3]["uris"]) == 2 and len(adds[1][3]["uris"]) == 1
     assert db.source("link:A")["playlist"]["id"]
 
@@ -405,3 +405,124 @@ def test_sync_only_new_likes(env, monkeypatch):
     assert lib[-1][2]["uris"] == "spotify:track:" + "q" * 22
     assert db.counts("my_likes")["saved_library"] == 2
     assert db.source("my_likes")["last_sync"]["new"] == 1
+
+
+# --- прогресс, уведомления, причины спорности, описание/обложка/дубли плейлиста ---
+
+def test_eta_and_notification(env, monkeypatch):
+    db = env
+    from app import jobs, notify
+    assert jobs.eta_seconds(10, 100, 20.0) == 180.0
+    assert jobs.eta_seconds(1, 100, 20.0) is None          # рано судить
+    assert jobs.fmt_duration(30) == "меньше минуты" and jobs.fmt_duration(3900) == "1 ч 5 мин"
+    notify.sent.clear()
+
+    def fail():
+        raise RuntimeError("что-то сломалось")
+    assert jobs._run("transfer", fail); st = wait_job()
+    assert st["error"] == "что-то сломалось"
+    assert notify.sent[-1] == ("Перенос: остановлено", "что-то сломалось")
+    # выключили уведомления — больше не шлём
+    s = db.get("settings"); s["notifications"] = False; db.put("settings", s)
+    notify.sent.clear()
+    assert jobs._run("transfer", fail); wait_job()
+    assert notify.sent == []
+
+
+def test_notification_settings_page(env):
+    db = env
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app import notify
+    c = TestClient(app)
+    assert "Проверить уведомление" in c.get("/").text
+    notify.sent.clear()
+    c.post("/settings/notifications", data={"enabled": "1", "action": "test"})
+    assert notify.sent and db.get("settings")["notifications"] is True
+    c.post("/settings/notifications", data={"action": "save"})
+    assert db.get("settings")["notifications"] is False
+
+
+def test_remix_never_auto_and_reasons(env, monkeypatch):
+    db = env
+    from app import jobs, matcher
+    from fastapi.testclient import TestClient
+    from app.main import app
+    src = matcher.Source("Numb", None, ["Linkin Park"], "Meteora", 187000, isrc="USWB10300474")
+    remix = {"name": "Numb - Remix", "artists": [{"name": "Linkin Park"}], "album": {"name": "Meteora"},
+             "duration_ms": 187000, "isrc": "USWB10300474"}
+    assert matcher.score(src, remix) < matcher.AUTO_THRESHOLD
+    assert any("ремикс" in w for w in matcher.explain(src, remix))
+    karaoke = {"name": "Numb", "artists": [{"name": "Karaoke Hits Band"}], "album": {"name": "Meteora"},
+               "duration_ms": 187000}
+    assert matcher.score(src, karaoke) < matcher.AUTO_THRESHOLD
+    for title in ("Numb (Live)", "Numb (Sped Up)", "Numb - Acoustic", "Numb (Cover)"):
+        assert matcher.score(src, {**remix, "name": title, "isrc": None}) < matcher.AUTO_THRESHOLD, title
+    orig = {**remix, "name": "Numb"}
+    assert matcher.score(src, orig) >= matcher.AUTO_THRESHOLD and matcher.explain(src, orig) == []
+
+    # старое автоматическое совпадение с ремиксом при следующем поиске уходит на проверку
+    view = matcher.candidate_view({**remix, "uri": "spotify:track:" + "r" * 22}, 90.0)
+    view.pop("why")
+    _add(db, "1", 0, "Numb", ["Linkin Park"], 187000, status="auto", spotify_uri=view["uri"],
+         candidates=json.dumps([view]), album="Meteora")
+    _fake_search(monkeypatch, {})
+    assert jobs.start_match(); wait_job()
+    assert db.query("SELECT status FROM tracks")[0]["status"] == "review"
+    page = TestClient(app).get("/review?status=review").text
+    assert "Почему спорный" in page and "ремикс" in page
+
+
+def test_playlist_description_cover_and_no_duplicates(env, monkeypatch):
+    db = env
+    from app import jobs, covers, spotify_client as sp
+    db.put("spotify_user", {"id": "me", "name": "Me"})
+    uri = lambda ch: "spotify:track:" + ch * 22
+    calls = []
+    existing = {"name": "Яндекс Музыка: Рок", "id": "OLD", "owner": {"id": "me"}}
+
+    def fake_request(method, path, params=None, json=None, essential=False, _retry=0):
+        calls.append((method, path, params, json))
+        if method == "GET" and path == "/me/playlists":
+            return {"items": [existing] if existing else [], "next": None}
+        if method == "POST" and path == "/me/playlists":
+            return {"id": "NEW"}
+        if method == "GET" and path.endswith("/items"):
+            return {"items": [{"item": {"uri": uri("a")}}], "next": None}
+        return None
+    monkeypatch.setattr(sp, "request", fake_request)
+    covers_set = []
+    monkeypatch.setattr(covers, "download", lambda url, proxy=None: b"img")
+    monkeypatch.setattr(covers, "to_jpeg", lambda raw: b"jpeg")
+    monkeypatch.setattr(sp, "set_cover", lambda pid, jpeg: covers_set.append((pid, jpeg)))
+
+    db.save_source("link:R", {"title": "Рок", "description": "Лучший\nрок", "image": "https://x/cover.jpg"})
+    _add(db, "1", 0, "A", ["X"], status="auto", spotify_uri=uri("a"), source_key="link:R")
+    _add(db, "2", 1, "B", ["Y"], status="auto", spotify_uri=uri("b"), source_key="link:R")
+
+    # плейлист с таким названием уже есть в Spotify: дополняем его, трек «a» там уже лежит
+    assert jobs.start_transfer(False, True, None, key="link:R"); st = wait_job()
+    assert st["error"] is None, st
+    adds = [c for c in calls if c[0] == "POST" and c[1].endswith("/items")]
+    assert adds == [("POST", "/playlists/OLD/items", None, {"uris": [uri("b")]})]
+    assert "пропущено дублей: 1" in st["message"] and not covers_set
+
+    # новый плейлист: описание из Яндекса и обложка
+    existing = None
+    db.execute("UPDATE tracks SET in_playlist=0")
+    calls.clear()
+    assert jobs.start_transfer(False, True, "Новый", key="link:R"); st = wait_job()
+    assert st["error"] is None, st
+    created = [c for c in calls if c[:2] == ("POST", "/me/playlists")][0]
+    assert created[3]["description"] == "Лучший рок · Перенесено из Яндекс Музыки"
+    assert covers_set == [("NEW", b"jpeg")] and "обложка перенесена" in st["message"]
+
+
+def test_cover_to_jpeg():
+    import io
+    from PIL import Image
+    from app import covers
+    buf = io.BytesIO(); Image.new("RGB", (1000, 800), "red").save(buf, "PNG")
+    out = covers.to_jpeg(buf.getvalue())
+    img = Image.open(io.BytesIO(out))
+    assert img.format == "JPEG" and img.size == (640, 640) and len(out) * 4 / 3 <= covers.MAX_BYTES
