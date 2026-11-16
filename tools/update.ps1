@@ -34,9 +34,16 @@ try {
         Remove-Item -Recurse -Force $tmp
     }
 
+    $uv = Get-Command uv -ErrorAction SilentlyContinue
+    $uvPath = if ($uv) { $uv.Source } else { Join-Path $env:USERPROFILE '.local\bin\uv.exe' }
     $py = Join-Path $Root 'python\python.exe'
     if (-not (Test-Path $py)) { $py = Join-Path $Root '.venv\Scripts\python.exe' }
-    if (Test-Path $py) {
+    if (Test-Path $uvPath) {
+        Write-Host 'Проверяю библиотеки (uv sync)...'
+        Push-Location $Root
+        try { & $uvPath sync --frozen --no-dev } finally { Pop-Location }
+        if ($LASTEXITCODE -ne 0) { throw 'uv sync не удался' }
+    } elseif (Test-Path $py) {
         Write-Host 'Проверяю библиотеки...'
         & $py -m pip install -q --disable-pip-version-check -r (Join-Path $Root 'requirements.txt')
         if ($LASTEXITCODE -ne 0) { throw 'не удалось обновить библиотеки' }
